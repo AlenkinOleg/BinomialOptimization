@@ -76,7 +76,7 @@ def expected_improvement_approx(mean_values, std_values, opt_value, binomial, n_
         
     return np.array(EI)
 
-def fidelity_decision(low_trials, successful, min_value, treshold_proba=0.5):
+def fidelity_decision(low_trials, successful, min_value, latent_min_value=None, ei_mean=None, ei_std=None, treshold_proba=0.5):
     """
     Rule for making decision: continue investigate this point or move to another using EI acquisition function.
     Parameters:
@@ -91,6 +91,10 @@ def fidelity_decision(low_trials, successful, min_value, treshold_proba=0.5):
         Decision, boolean.
     """
     
+    if (ei_mean is not None) and (ei_std is not None) and (latent_min_value is not None):
+        
+        treshold_proba = norm.cdf(latent_min_value, loc=ei_mean, scale=ei_std)
+    
     n = low_trials
     k = successful
     posterior_ps = beta(k+1, n-k+1)
@@ -99,34 +103,11 @@ def fidelity_decision(low_trials, successful, min_value, treshold_proba=0.5):
         return True
     return False
 
-def get_new_point(model, lower_bounds, upper_bounds, opt_value,
-                  multistart=10, seed=None, method='gaussian', n_sample=500, constraints=None, optimization_method='L-BFGS-B'):
-    """
-    
-    Parameters:
-    
-        model                                - GP or GGPM model of the objective function;
-        lower_bounds, upper_bounds           - array-like, lower and upper bounds of x;
-        multistart                           - number of multistart runs;
-        seed                                 - np.random.RandomState;
-        method                               - gaussian or approximated;
-        opt_value                            - current optimal value;
-        n_sample                             - number of points for approximated EI calculation;
-        constraints                          - constraints on parameters;
-        optimization_method                  - method for acquisition function optimization.
-    
-    Returns:
-    
-        tuple - argmin of the objective function and min value of the objective
-    """
-    
+def get_new_point(model, bounds, opt_value, initial_points=None, seed=None, 
+                  method='gaussian', n_sample=500, constraints=None, max_iter=5):
+
     if seed is not None:
         np.random.seed(seed)
-    
-    lower_bounds = np.array(lower_bounds).reshape(1, -1)
-    upper_bounds = np.array(upper_bounds).reshape(1, -1)
-
-    random_initial_points = np.random.uniform(lower_bounds, upper_bounds, size=(multistart, lower_bounds.shape[1]))
 
     def acquisition(x):
         
@@ -145,25 +126,16 @@ def get_new_point(model, lower_bounds, upper_bounds, opt_value,
             
             return -expected_improvement_approx(mean_values, std_values, opt_value, GPy.likelihoods.Binomial(), n_sample)
 
-    best_result = None
-    best_value = np.inf
-    for random_point in random_initial_points:
-        
-        try:
-            result = minimize(acquisition, random_point, method=optimization_method, 
-                              bounds=np.vstack((lower_bounds, upper_bounds)).T,
-                              constraints=constraints)
-            if result.fun < best_value:
-                best_value = result.fun
-                best_result = result
-        except:
-            print("bad point")
 
-    return best_result.x, best_result.fun
+    problem = GPyOpt.methods.BayesianOptimization(acquisition, bounds, constraints, exact_feval=True, 
+                                                  initial_design_numdata=100, batch_size=100)
+    problem.run_optimization(max_iter)
+    
+    return problem.x_opt, problem.fx_opt
 
-def optimization_step(training_points, training_values, objective, trials=None, n_trials_low=20, 
-                      n_trials_high=np.nan, lower_bounds=None, upper_bounds=None, kernel=GPy.kern.RBF(1), 
-                      method='gaussian', treshold_proba=0.5, constraints=None):
+def optimization_step(training_points, training_values, objective, space, trials=None, n_trials_low=20, 
+                      n_trials_high=np.nan, kernel=GPy.kern.RBF(1), 
+                      method='gaussian', treshold_proba=0.5, constraints=None, dinamic_treshold=False):
     
     if trials.ndim != 2:
         trials = trials.reshape(-1, 1)
@@ -173,23 +145,17 @@ def optimization_step(training_points, training_values, objective, trials=None, 
         
     elif method=='laplace':
         binomial = GPy.likelihoods.Binomial()
-        model = GPy.core.GP(training_points, training_values, kernel=kernel, 
-                              Y_metadata={'trials': trials},
-                              inference_method=GPy.inference.latent_function_inference.laplace.Laplace(),
-                              likelihood=binomial)
+        model = GPy.core.GP(training_points, training_values, kernel=kernel,
+                            Y_metadata={'trials': trials},
+                            inference_method=GPy.inference.latent_function_inference.laplace.Laplace(),
+                            likelihood=binomial)
     else:
         raise ValueError("method must be gaussian or laplace.")
         
     model.optimize_restarts(num_restarts=10, verbose=False)
-    
-    if constraints:
-        new_point, criterion_value = get_new_point(model, opt_value=np.min(training_values/trials),
-                                                   lower_bounds=lower_bounds, upper_bounds=upper_bounds, method=method,
-                                                   constraints=constraints, optimization_method='SLSQP')
-    else:
-        new_point, criterion_value = get_new_point(model, opt_value=np.min(training_values/trials),
-                                                   lower_bounds=lower_bounds, upper_bounds=upper_bounds, method=method,
-                                                   optimization_method='L-BFGS-B')
+
+    new_point, criterion_value = get_new_point(model, opt_value=np.min(training_values/trials), method=method,
+                                               constraints=constraints, bounds=space)
     
     new_point = new_point.reshape(1, -1)
     new_value = np.asarray(objective(new_point, n_trials_low)).reshape(1, -1)
@@ -198,9 +164,33 @@ def optimization_step(training_points, training_values, objective, trials=None, 
     
     if (n_trials_high >= n_trials_low+1) and (method == 'laplace'):
 
+        ei_mean = None
+        ei_std = None
+        latent_min = None
+        
+        if dinamic_treshold:
+            
+            trials_t = np.vstack([trials, np.array([[new_trials]])])
+            training_values_t = np.vstack([training_values, new_value])
+
+            binomial = GPy.likelihoods.Binomial()
+            model_t = GPy.core.GP(training_points, training_values_t, kernel=kernel, 
+                                  Y_metadata={'trials': trials_t},
+                                  inference_method=GPy.inference.latent_function_inference.laplace.Laplace(),
+                                  likelihood=binomial)
+            model_t.optimize_restarts(num_restarts=10, verbose=False)
+            
+            ei_point, criterion_value = get_new_point(model_t, opt_value=np.min(training_values_t/trials_t), method=method,
+                                                      constraints=constraints, bounds=space)
+                
+            ei_mean, ei_std = model_t._raw_predict(ei_point.reshape(1, -1))
+            latent_min = np.min(model_t._raw_predict(training_points)[0])
+            ei_mean = ei_mean[0,0]
+            ei_std = ei_std[0,0]
+            
         if fidelity_decision(n_trials_low, new_value, 
-                             model.likelihood.gp_link.transf(np.min(model._raw_predict(training_points)[0])), 
-                             treshold_proba):
+                             model.likelihood.gp_link.transf(np.min(model._raw_predict(training_points)[0])), latent_min,
+                             ei_mean, ei_std, treshold_proba):
 
             new_value = new_value + objective(new_point, n_trials_high-n_trials_low)
             new_trials = n_trials_high

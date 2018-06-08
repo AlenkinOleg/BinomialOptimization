@@ -76,7 +76,7 @@ def expected_improvement_approx(mean_values, std_values, opt_value, binomial, n_
         
     return np.array(EI)
 
-def fidelity_decision(low_trials, successful, min_value, treshold_proba=0.5):
+def fidelity_decision(low_trials, successful, min_value, ei_mean=None, ei_std=None, treshold_proba=0.5):
     """
     Rule for making decision: continue investigate this point or move to another using EI acquisition function.
     Parameters:
@@ -90,6 +90,10 @@ def fidelity_decision(low_trials, successful, min_value, treshold_proba=0.5):
         
         Decision, boolean.
     """
+    
+    if (ei_mean is not None) and (ei_std is not None):
+        
+        treshold_proba = 1 - norm.cdf(min_value, loc=ei_mean, scale=ei_std)
     
     n = low_trials
     k = successful
@@ -163,7 +167,7 @@ def get_new_point(model, lower_bounds, upper_bounds, opt_value,
 
 def optimization_step(training_points, training_values, objective, trials=None, n_trials_low=20, 
                       n_trials_high=np.nan, lower_bounds=None, upper_bounds=None, kernel=GPy.kern.RBF(1), 
-                      method='gaussian', treshold_proba=0.5, constraints=None):
+                      method='gaussian', treshold_proba=0.5, constraints=None, dinamic_treshold=False):
     
     if trials.ndim != 2:
         trials = trials.reshape(-1, 1)
@@ -173,10 +177,10 @@ def optimization_step(training_points, training_values, objective, trials=None, 
         
     elif method=='laplace':
         binomial = GPy.likelihoods.Binomial()
-        model = GPy.core.GP(training_points, training_values, kernel=kernel, 
-                              Y_metadata={'trials': trials},
-                              inference_method=GPy.inference.latent_function_inference.laplace.Laplace(),
-                              likelihood=binomial)
+        model = GPy.core.GP(training_points, training_values, kernel=kernel,
+                            Y_metadata={'trials': trials},
+                            inference_method=GPy.inference.latent_function_inference.laplace.Laplace(),
+                            likelihood=binomial)
     else:
         raise ValueError("method must be gaussian or laplace.")
         
@@ -198,9 +202,44 @@ def optimization_step(training_points, training_values, objective, trials=None, 
     
     if (n_trials_high >= n_trials_low+1) and (method == 'laplace'):
 
+        ei_mean = None
+        ei_std = None
+        
+        if dinamic_treshold:
+            
+            trials_t = np.vstack([trials, np.array([[new_trials]])])
+            training_values_t = np.vstack([training_values, new_value])
+            
+            if method=='gaussian':
+                model_t = GPy.models.GPRegression(training_points, training_values_t / trials_t, kernel)
+
+            elif method=='laplace':
+                binomial = GPy.likelihoods.Binomial()
+                model_t = GPy.core.GP(training_points, training_values_t, kernel=kernel, 
+                                      Y_metadata={'trials': trials_t},
+                                      inference_method=GPy.inference.latent_function_inference.laplace.Laplace(),
+                                      likelihood=binomial)
+            
+            if constraints:
+                ei_point, criterion_value = get_new_point(model_t, opt_value=np.min(training_values_t/trials_t),
+                                                          lower_bounds=lower_bounds, upper_bounds=upper_bounds, method=method,
+                                                          constraints=constraints, optimization_method='SLSQP')
+            else:
+                ei_point, criterion_value = get_new_point(model_t, opt_value=np.min(training_values_t/trials_t),
+                                                          lower_bounds=lower_bounds, upper_bounds=upper_bounds, method=method,
+                                                          optimization_method='L-BFGS-B')
+                
+            if method=='gaussian':
+                ei_mean, ei_std = model.predict(ei_point.reshape(1, -1))
+            elif method=='laplace':
+                ei_mean, ei_std = model._raw_predict(ei_point.reshape(1, -1))
+                
+            ei_mean = ei_mean[0,0]
+            ei_std = ei_std[0,0]
+            
         if fidelity_decision(n_trials_low, new_value, 
                              model.likelihood.gp_link.transf(np.min(model._raw_predict(training_points)[0])), 
-                             treshold_proba):
+                             ei_mean, ei_std, treshold_proba):
 
             new_value = new_value + objective(new_point, n_trials_high-n_trials_low)
             new_trials = n_trials_high
